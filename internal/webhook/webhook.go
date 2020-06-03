@@ -92,10 +92,6 @@ func (f *Flags) Process() error {
 	return nil
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-	log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
-}
 
 // CallWebHookMessage .
 type CallWebHookMessage struct {
