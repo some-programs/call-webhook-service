@@ -92,7 +92,6 @@ func (f *Flags) Process() error {
 	return nil
 }
 
-
 // CallWebHookMessage .
 type CallWebHookMessage struct {
 	URL     string          `json:"url"`
@@ -145,7 +144,7 @@ func (r RetryMessage) LogLine(action string) string {
 func (c *CallWebhookWorker) Start() error {
 	var flags Flags
 	flags.Register()
-	fenv.CommandLinePrefix("CALL_URL_")
+	fenv.CommandLinePrefix("CALL_WEBHOOK_")
 	fenv.MustParse()
 	flag.Parse()
 	if err := flags.Process(); err != nil {
