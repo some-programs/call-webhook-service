@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
 	"os"
 	"sort"
@@ -23,8 +21,6 @@ import (
 	"github.com/some-programs/call-webhook-service/internal/backoff"
 	"github.com/some-programs/call-webhook-service/internal/stanctx"
 	"golang.org/x/time/rate"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	_ "net/http/pprof" // register pprof
 )
@@ -102,61 +98,35 @@ func (c *CallWebhookWorker) Start() error {
 		log.Printf("configuration: %s", string(data))
 	}
 
-	if flags.MetricsAddr != "" {
-		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			http.HandleFunc("/webhook/ok", func(w http.ResponseWriter, r *http.Request) {
-				time.Sleep(time.Duration(rand.Intn(3)) * time.Second)
-				w.WriteHeader(200)
-				data, err := ioutil.ReadAll(r.Body)
-				r.Body.Close()
-				if err != nil {
-					log.Printf("webhook: %v", err)
-					return
-				}
-				log.Printf("webhook: data: %s", string(data))
-			})
-			http.HandleFunc("/webhook/500", func(w http.ResponseWriter, r *http.Request) {
-				time.Sleep(time.Duration(rand.Intn(3)) * time.Second)
-				w.WriteHeader(500)
-				data, err := ioutil.ReadAll(r.Body)
-				r.Body.Close()
-				if err != nil {
-					log.Printf("webhook: %v", err)
-					return
-				}
-				log.Printf("webhook: data: %s", string(data))
-			})
-			http.HandleFunc("/webhook/rand", func(w http.ResponseWriter, r *http.Request) {
-				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
-				if rand.Float64() > 0.95 {
-					return
-				}
-				if rand.Float64() > 0.95 {
-					time.Sleep(flags.PostTimeout + time.Second)
-					return
-				}
-				time.Sleep(time.Duration(rand.Intn(1000)) * time.Millisecond)
-				if rand.Float64() > 0.25 {
-					w.WriteHeader(200 + rand.Intn(4))
-				} else {
-					w.WriteHeader(400 + rand.Intn(150))
-				}
-				time.Sleep(time.Duration(rand.Intn(2000)) * time.Millisecond)
-
-				data, err := ioutil.ReadAll(r.Body)
-				r.Body.Close()
-				if err != nil {
-					log.Printf("webhook: %v", err)
-					return
-				}
-				log.Printf("webhook: data: %s", string(data))
-			})
-			http.ListenAndServe(flags.MetricsAddr, nil)
-		}()
-	}
-
 	ctx := context.Background()
+
+	if flags.MetricsAddr != "" {
+		AddMetricsHandlers(ctx, nil)
+		AddDebugHandlers(ctx, nil, flags.PostTimeout)
+
+		srv := http.Server{Addr: flags.MetricsAddr}
+
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					if err := srv.Shutdown(ctx); err != nil {
+						log.Printf("HTTP server Shutdown: %v", err)
+					}
+					return
+				}
+
+			}
+			// http.ListenAndServe(flags.MetricsAddr, nil)
+		}()
+
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("HTTP server ListenAndServe: %v", err)
+		}
+
+	}
 
 	c.httpRateLimiter = rate.NewLimiter(rate.Limit(flags.RateLimit), flags.RateBurst)
 
