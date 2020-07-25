@@ -4,18 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"math"
 	"net/http"
-	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-pa/fenv"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/stan.go"
 	"github.com/some-programs/call-webhook-service/internal/backoff"
@@ -79,79 +76,10 @@ func (r RetryMessage) LogLine(action string) string {
 	return fmt.Sprintf("[seq:%v] retry #%v  %v :: %s", r.StanMsg.Sequence, r.Retries, r.Next.Format("0102 15:04:05.000"), action)
 }
 
-func (c *CallWebhookWorker) Start() error {
-	var flags Flags
-	flags.Register()
-	fenv.CommandLinePrefix("CALL_WEBHOOK_")
-	fenv.MustParse()
-	flag.Parse()
-	if err := flags.Process(); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	if flags.PrintConfig {
-		data, err := json.MarshalIndent(flags, "", " ")
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("configuration: %s", string(data))
-	}
-
-	ctx := context.Background()
-
-	if flags.MetricsAddr != "" {
-		AddMetricsHandlers(ctx, nil)
-		AddDebugHandlers(ctx, nil, flags.PostTimeout)
-
-		srv := http.Server{Addr: flags.MetricsAddr}
-
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					if err := srv.Shutdown(ctx); err != nil {
-						log.Printf("HTTP server Shutdown: %v", err)
-					}
-					return
-				}
-
-			}
-			// http.ListenAndServe(flags.MetricsAddr, nil)
-		}()
-
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatalf("HTTP server ListenAndServe: %v", err)
-		}
-
-	}
-
+func (c *CallWebhookWorker) Start(ctx context.Context, flags Flags) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	c.httpRateLimiter = rate.NewLimiter(rate.Limit(flags.RateLimit), flags.RateBurst)
-
-	var sc *stanctx.Conn
-	{
-		var attempts int
-	connloop:
-		for {
-			var err error
-			sc, err = stanctx.Connect("test-cluster", "client-123", stan.NatsURL(flags.Nats.NatsURL))
-			if err != nil {
-				if err == nats.ErrNoServers {
-					log.Printf("# %v . could not connect to nats, will do 20 attempts before abandoning: %v", attempts, err)
-					time.Sleep(time.Second)
-					attempts++
-					if attempts <= 20 {
-						continue connloop
-					}
-				}
-
-				log.Fatal(err)
-			}
-			break connloop
-		}
-	}
 
 	// log backoff settings example
 	if flags.PrintConfig {
@@ -168,6 +96,28 @@ func (c *CallWebhookWorker) Start() error {
 			durs = append(durs, rm.Next.Sub(t).Round(time.Second).String())
 		}
 		log.Printf("example backoff series: %s", strings.Join(durs, ", "))
+	}
+
+	var sc *stanctx.Conn
+	{
+		var attempts int
+	connloop:
+		for {
+			var err error
+			sc, err = stanctx.Connect("test-cluster", "client-123", stan.NatsURL(flags.Nats.NatsURL))
+			if err != nil {
+				if err == nats.ErrNoServers {
+					log.Printf("error connecting to nats attempt #%v", attempts+1)
+					time.Sleep(time.Second)
+					attempts++
+					if attempts <= 2 {
+						continue connloop
+					}
+				}
+				log.Fatal(err)
+			}
+			break connloop
+		}
 	}
 
 	sub, err := sc.Subscribe("call_webhook",
