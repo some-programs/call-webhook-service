@@ -67,9 +67,10 @@ func main() {
 		}()
 
 	}
+	messagesCh := make(chan webhook.CallWebHookMessage, flags.Nats.MaxInFlight)
 
 	c := webhook.CallWebhookWorker{}
-	if err := c.Start(ctx, flags); err != nil {
+	if err := c.Start(ctx, flags, messagesCh); err != nil {
 		log.Fatal(err)
 	}
 }

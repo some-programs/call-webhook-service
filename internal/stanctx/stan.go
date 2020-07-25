@@ -12,7 +12,12 @@ import (
 )
 
 func Connect(stanClusterID, clientID string, options ...stan.Option) (*Conn, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
+	return ConnectContext(ctx, stanClusterID, clientID, options...)
+}
+
+func ConnectContext(ctx context.Context, stanClusterID, clientID string, options ...stan.Option) (*Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	conn := &Conn{
 		ctx:    ctx,
 		cancel: cancel,

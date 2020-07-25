@@ -10,13 +10,10 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/stan.go"
 	"github.com/some-programs/call-webhook-service/internal/backoff"
-	"github.com/some-programs/call-webhook-service/internal/stanctx"
 	"golang.org/x/time/rate"
 
 	_ "net/http/pprof" // register pprof
@@ -44,7 +41,6 @@ type RetryMessage struct {
 
 	Msg          CallWebHookMessage
 	NextUnixNano int64
-	StanMsg      *stan.Msg
 
 	Retries int
 }
@@ -73,10 +69,10 @@ func (r *RetryMessage) SetNext(eb backoff.ExpBackoff) bool {
 }
 
 func (r RetryMessage) LogLine(action string) string {
-	return fmt.Sprintf("[seq:%v] retry #%v  %v :: %s", r.StanMsg.Sequence, r.Retries, r.Next.Format("0102 15:04:05.000"), action)
+	return fmt.Sprintf("retry #%v  %v :: %s", r.Retries, r.Next.Format("0102 15:04:05.000"), action)
 }
 
-func (c *CallWebhookWorker) Start(ctx context.Context, flags Flags) error {
+func (c *CallWebhookWorker) Start(ctx context.Context, flags Flags, ch <-chan CallWebHookMessage) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c.httpRateLimiter = rate.NewLimiter(rate.Limit(flags.RateLimit), flags.RateBurst)
@@ -98,83 +94,27 @@ func (c *CallWebhookWorker) Start(ctx context.Context, flags Flags) error {
 		log.Printf("example backoff series: %s", strings.Join(durs, ", "))
 	}
 
-	var sc *stanctx.Conn
-	{
-		var attempts int
-	connloop:
-		for {
-			var err error
-			sc, err = stanctx.Connect("test-cluster", "client-123", stan.NatsURL(flags.Nats.NatsURL))
-			if err != nil {
-				if err == nats.ErrNoServers {
-					log.Printf("error connecting to nats attempt #%v", attempts+1)
-					time.Sleep(time.Second)
-					attempts++
-					if attempts <= 2 {
-						continue connloop
-					}
-				}
-				log.Fatal(err)
-			}
-			break connloop
-		}
-	}
-
-	sub, err := sc.Subscribe("call_webhook",
-		stan.DurableName(flags.Nats.DurableName),
-		stan.AckWait(flags.Nats.AckWait),
-		stan.MaxInflight(flags.Nats.MaxInFlight),
-		stan.SetManualAckMode())
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	addRetryCh := make(chan RetryMessage, 5000)
 	doRetryCh := make(chan RetryMessage, (flags.Workers+flags.RetryWorkers)*2)
-	ch := make(chan *stan.Msg, flags.Nats.MaxInFlight)
-
-	var (
-		seqMaxRecv   uint64
-		seqMaxRecvMu sync.Mutex
-
-		seqMaxLastPostSuccess   uint64
-		seqMaxLastPostSuccessMu sync.Mutex
-	)
 
 	// handle new messages
 	for i := 0; i < flags.Workers; i++ {
 		go func() {
-		messages:
 			for {
 				select {
-				case m := <-ch:
+				case cm := <-ch:
 					promMsgsRreceived.Inc()
 
-					seqMaxRecvMu.Lock()
-					if m.Sequence > seqMaxRecv {
-						seqMaxRecv = m.Sequence
-						promHighestReceivedSequence.Set(float64(seqMaxRecv))
-					}
-					seqMaxRecvMu.Unlock()
-
-					cm, err := c.parseMessage(m)
-					if err != nil {
-						promMsgsInvalidFormat.Inc()
-						log.Printf("[seq:%v] error parsing message: %v", m.Sequence, err)
-						m.Ack()
-						continue messages
-					}
-
-					log.Printf("[seq:%v] recv url:%v", m.Sequence, cm.URL)
+					log.Printf("recv url:%v", cm.URL)
 					if err := c.httpRateLimiter.Wait(ctx); err != nil {
 						log.Fatal("err", err)
 					}
 
 					ctx, cancel := context.WithTimeout(context.Background(), flags.PostTimeout)
-					status, err := c.postJSON(ctx, cm.URL, cm.Payload)
+					status, err := postJSON(ctx, cm.URL, cm.Payload)
 					cancel()
 					if err != nil {
-						log.Printf("[seq:%v] error posting message:%v", m.Sequence, err)
+						log.Printf("error posting message:%v", err)
 					}
 					if err != nil || !(status >= 200 && status < 300) {
 						promPostFailed.Inc()
@@ -182,7 +122,6 @@ func (c *CallWebhookWorker) Start(ctx context.Context, flags Flags) error {
 							rm := RetryMessage{
 								Created: time.Now(),
 								Msg:     cm,
-								StanMsg: m,
 							}
 							if rm.SetNext(flags.Backoff) {
 								log.Println(rm.LogLine("send to addRetryCh:"))
@@ -191,18 +130,8 @@ func (c *CallWebhookWorker) Start(ctx context.Context, flags Flags) error {
 						}
 					} else {
 						promPostSuccess.Inc()
-
-						seqMaxLastPostSuccessMu.Lock()
-						if m.Sequence > seqMaxLastPostSuccess {
-							seqMaxLastPostSuccess = m.Sequence
-							promHighestReceivedSequence.Set(float64(seqMaxLastPostSuccess))
-						}
-						seqMaxLastPostSuccessMu.Unlock()
-
 					}
-					if err := m.Ack(); err != nil {
-						log.Printf("[seq:%v] error Ack'ing message:%v", m.Sequence, err)
-					}
+
 				}
 			}
 		}()
@@ -274,26 +203,20 @@ func (c *CallWebhookWorker) Start(ctx context.Context, flags Flags) error {
 					}
 
 					ctx, cancel := context.WithTimeout(context.Background(), flags.PostTimeout)
-					status, err := c.postJSON(ctx, m.Msg.URL, m.Msg.Payload)
+					status, err := postJSON(ctx, m.Msg.URL, m.Msg.Payload)
 					cancel()
 					promPostRetries.Inc()
 					if err != nil {
-						log.Printf("[seq:%v] error posting message:%v", m.StanMsg.Sequence, err)
+						log.Printf("error posting message:%v", err)
 					}
 					if err != nil || !(status >= 200 && status < 300) {
 						promPostFailed.Inc()
 						if m.SetNext(flags.Backoff) {
 							addRetryCh <- m
 						} else {
-							log.Printf("[seq:%v] max retry age reached", m.StanMsg.Sequence)
+							log.Printf("max retry age reached")
 						}
 					} else {
-						seqMaxLastPostSuccessMu.Lock()
-						if m.StanMsg.Sequence > seqMaxLastPostSuccess {
-							seqMaxLastPostSuccess = m.StanMsg.Sequence
-							promHighestReceivedSequence.Set(float64(seqMaxLastPostSuccess))
-						}
-						seqMaxLastPostSuccessMu.Unlock()
 						promPostSuccess.Inc()
 					}
 				}
@@ -301,20 +224,18 @@ func (c *CallWebhookWorker) Start(ctx context.Context, flags Flags) error {
 		}()
 	}
 
-	err = sub.StartChan(ctx, ch)
-	if err != nil {
-		log.Printf("error from subscribe: %v", err)
-	}
-	return err
+
+
+	return nil
 }
 
-func (c *CallWebhookWorker) parseMessage(m *stan.Msg) (CallWebHookMessage, error) {
+func parseStanMessage(m *stan.Msg) (CallWebHookMessage, error) {
 	var cm CallWebHookMessage
 	err := json.Unmarshal(m.Data, &cm)
 	return cm, err
 }
 
-func (c *CallWebhookWorker) postJSON(ctx context.Context, URL string, payload []byte) (int, error) {
+func postJSON(ctx context.Context, URL string, payload []byte) (int, error) {
 	req, err := http.NewRequest("POST", URL, bytes.NewBuffer(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(ctx)
